@@ -270,6 +270,8 @@
 .feature-field{display:flex;flex-direction:column;gap:8px;font-size:12px;color:#bdc4d1;min-width:0}.feature-field:has(input[type=checkbox]){flex-direction:row;align-items:center;gap:6px}.feature-field input[type=checkbox],.cue-select-checkbox{width:16px;height:16px;accent-color:#d4fc6a;flex:none}
 .feature-field input:not([type=checkbox]){width:100%;min-width:0;padding:9px;border:1px solid #353b46;border-radius:8px;background:#151820;color:#f4f5fa}.feature-field input[type=color]{height:36px;padding:3px}.feature-count{font-size:12px;color:#d4fc6a;white-space:nowrap}
 .feature-details{border-top:1px solid #30343c;padding:14px 0}.feature-details summary{cursor:pointer;font-size:13px;font-weight:600;color:#e2e6ef}.feature-details[open] summary{margin-bottom:14px}.feature-details>.button,.feature-details>select{margin:8px 6px 0 0}.feature-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.feature-checks{display:flex;gap:15px;flex-wrap:wrap;margin:12px 0}.feature-details textarea{width:100%;resize:vertical;padding:12px;border:1px solid #353b46;border-radius:8px;background:#151820;color:#f4f5fa;font:inherit;line-height:1.65;margin-bottom:10px}.feature-details select{min-width:0;max-width:100%;background:#151820;color:#f4f5fa;border:1px solid #353b46;border-radius:8px;padding:9px}
+.bilingual-panel .gallery-heading{margin-top:16px}.bilingual-panel .secondary-preset-grid{margin:8px 0 12px}.bilingual-panel .secondary-style-note{margin-top:10px}
+.media-source{position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:.001;pointer-events:none}.sound-toggle.is-muted{color:#f5a2b9;background:#40262f}.sound-toggle:not(.is-muted){color:var(--accent)}
 .subtitle-issues{display:grid;gap:7px;margin-top:12px;max-height:280px;overflow:auto}.subtitle-issue{display:block;text-align:left;white-space:normal;font-size:12px;height:auto;line-height:1.5;padding:9px}.cue-select-label{display:flex;align-items:center}.cue-card.is-batch-selected{border-color:#93b43c;box-shadow:inset 3px 0 0 #d4fc6a}
 .preview-guide-control{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 18px;border-top:1px solid #30343c}.preview-guide-control select{background:#161921;color:#cbd1de;border:1px solid #353b46;padding:7px;border-radius:8px;max-width:100%;font-size:12px}.preview-guide-control .style-help{margin:0;font-size:11px}.custom-position-controls label{display:block;color:#bdc4d1;font-size:12px;margin:12px 0}.custom-position-controls output{float:right;color:#d4fc6a}.preset-library>select{width:100%}
 #exportTrack{width:100%;margin-bottom:12px}#exportAssButton,#exportTxtButton{margin:8px 8px 12px 0}.subtitles-card .feature-details{margin:0 24px}.subtitles-card .subtitle-feature-tools{margin:0 24px}.style-scope{flex-wrap:wrap}
@@ -1547,6 +1549,21 @@ self.addEventListener('message', async ({ data }) => {
     return graph;
   }
 
+  // Normal preview should use the media element's native audio path. Only an
+  // element already connected for export needs its existing graph resumed.
+  async function resumePlaybackAudio(video) {
+    const graph = audioGraphs.get(video);
+    if (!graph) return null;
+    if (graph.context.state === 'closed') {
+      throw problem('Sesi audio sudah ditutup. Muat ulang halaman untuk melanjutkan.');
+    }
+    if (graph.context.state !== 'running') await graph.context.resume();
+    if (graph.context.state !== 'running') {
+      throw problem('Audio diblokir browser. Klik tombol suara lalu coba kembali.');
+    }
+    return graph;
+  }
+
   function waitForMedia(video, events, ready, signal, message, timeoutMs = 15000) {
     checkAbort(signal);
     if (ready()) return Promise.resolve();
@@ -1626,15 +1643,24 @@ self.addEventListener('message', async ({ data }) => {
     let recorder;
     let stopRecording;
     let recordingResult;
+    let capturedMediaStream = null;
     const ownedAudioTracks = [];
     try {
-      // Resume before waiting for metadata to retain the initiating click's gesture.
-      const audioReady = resumeAudio(video);
-      audioReady.catch(() => {});
+      // Prefer the media element's captured audio track. Unlike
+      // createMediaElementSource(), this does not reroute/silence preview audio.
+      const captureMedia = video.captureStream || video.mozCaptureStream;
+      if (typeof captureMedia === 'function') {
+        try { capturedMediaStream = captureMedia.call(video); } catch (_) { capturedMediaStream = null; }
+      }
+      const directAudio = capturedMediaStream?.getAudioTracks?.() || [];
+      // Web Audio remains a compatibility fallback. Start it while the export
+      // click still counts as a user gesture.
+      const audioReady = directAudio.length ? null : resumeAudio(video);
+      if (audioReady) audioReady.catch(() => {});
       video.pause();
       await waitForMedia(video, ['loadedmetadata', 'loadeddata'], () => video.readyState >= 1 && video.videoWidth > 0,
         signal, 'Informasi video belum siap. Tunggu video selesai dimuat.');
-      const graph = await audioReady;
+      const graph = audioReady ? await audioReady : null;
       checkAbort(signal);
       if (!Number.isFinite(video.duration) || video.duration <= 0) {
         throw problem('Durasi video tidak dapat dibaca. Coba berkas video lain.');
@@ -1655,7 +1681,9 @@ self.addEventListener('message', async ({ data }) => {
       checkAbort(signal);
       drawFrame(ctx, canvas.width, canvas.height, start);
       canvasStream = canvas.captureStream(30);
-      const audioTracks = graph.destination.stream.getAudioTracks().map(track => {
+      const sourceAudioTracks = directAudio.length ? directAudio : (graph?.destination.stream.getAudioTracks() || []);
+      if (!sourceAudioTracks.length) throw problem('Trek audio video tidak terbaca. Gunakan MP4 dengan audio AAC atau WebM dengan audio Opus.');
+      const audioTracks = sourceAudioTracks.map(track => {
         // Stop the per-export clone during cleanup, never the persistent graph's track.
         if (typeof track.clone === 'function') {
           const copy = track.clone();
@@ -1785,7 +1813,7 @@ self.addEventListener('message', async ({ data }) => {
           progress(0);
           watchdog = setInterval(() => {
             if (document.hidden) visibility();
-            else if (graph.context.state !== 'running') {
+            else if (graph && graph.context.state !== 'running') {
               stopRecording(problem('Audio terhenti saat ekspor. Buka kembali tab editor dan coba lagi.'));
             } else if (!started && performance.now() - lastAdvance > 15000) {
               stopRecording(problem('Video terlalu lama memulai pemutaran. Muat ulang video dan coba kembali.'));
@@ -1824,7 +1852,7 @@ self.addEventListener('message', async ({ data }) => {
     }
   }
 
-  window.SubstudioExporter = Object.freeze({ supportedMimeType, supportedFormats, ensureAudioGraph, resumeAudio, exportVideo });
+  window.SubstudioExporter = Object.freeze({ supportedMimeType, supportedFormats, ensureAudioGraph, resumeAudio, resumePlaybackAudio, exportVideo });
 })();
 
 </script>
@@ -3180,13 +3208,20 @@ self.addEventListener('message', async ({ data }) => {
     const lang = node('select', { id: 'secondaryLanguage', 'aria-label': 'Bahasa kedua' });
     [['indonesian', 'Bahasa Indonesia'], ['english', 'English'], ['arabic', 'العربية · Arab']].forEach(([value, text]) => lang.append(node('option', { value }, text)));
     const secondFont = $('fontFamilySelect').cloneNode(true); secondFont.id = 'secondaryFont'; secondFont.setAttribute('aria-label', 'Font bahasa kedua');
-    const secondColor = field('secondaryColor', 'Warna bahasa kedua', 'color'), secondSize = field('secondarySize', 'Ukuran bahasa kedua', 'number');
+    const secondColor = field('secondaryColor', 'Warna bahasa kedua', 'color'), secondAccent = field('secondaryAccent', 'Warna aksen', 'color'), secondSize = field('secondarySize', 'Ukuran bahasa kedua', 'number'), secondOutline = field('secondaryOutline', 'Ketebalan garis', 'number');
     secondSize.input.min = '24'; secondSize.input.max = '80'; secondSize.input.step = '1';
+    secondOutline.input.min = '0'; secondOutline.input.max = '8'; secondOutline.input.step = '0.5';
     const secondDirection = $('textDirectionSelect').cloneNode(true); secondDirection.id = 'secondaryDirection'; secondDirection.setAttribute('aria-label', 'Arah bahasa kedua');
-    const secondGrid = node('div', { class: 'feature-grid' }); secondGrid.append(lang, secondFont, secondColor.wrap, secondSize.wrap, secondDirection);
+    const secondAnimation = $('animationSelect').cloneNode(true); secondAnimation.id = 'secondaryAnimation'; secondAnimation.setAttribute('aria-label', 'Animasi bahasa kedua');
+    const secondGrid = node('div', { class: 'feature-grid' }); secondGrid.append(lang, secondFont, secondColor.wrap, secondAccent.wrap, secondSize.wrap, secondOutline.wrap, secondDirection, secondAnimation);
+    const secondPresetHeading = node('div', { class: 'gallery-heading' }); secondPresetHeading.append(node('span', {}, 'Efek teks bahasa kedua'), node('span', { class: 'count-badge' }, '18 GAYA'));
+    const secondPresetGrid = document.querySelector('.expanded-presets').cloneNode(true);
+    secondPresetGrid.classList.add('secondary-preset-grid'); secondPresetGrid.setAttribute('aria-label', 'Gaya subtitle bahasa kedua');
+    const secondPresetButtons = Array.from(secondPresetGrid.querySelectorAll('.preset'));
+    secondPresetButtons.forEach(item => { item.classList.remove('active'); item.setAttribute('aria-pressed', 'false'); });
     const importSecond = button('importSecondaryButton', 'Impor bahasa kedua'), copySecond = button('copySecondaryStyle', 'Gaya ini ke semua bahasa kedua');
     const secondFile = node('input', { id: 'secondarySubtitleInput', type: 'file', accept: '.srt,.vtt,.txt', hidden: '' });
-    bilingual.append(bilingualTitle, secondary, secondGrid, importSecond, copySecond, secondFile, node('p', { class: 'style-help' }, 'Isi terjemahan sendiri atau impor SRT/VTT/TXT. SRT/VTT dipasangkan berdasarkan waktu; TXT satu baris per subtitle. Terjemahan tidak dibuat otomatis.'));
+    bilingual.append(bilingualTitle, secondary, secondGrid, secondPresetHeading, secondPresetGrid, importSecond, copySecond, secondFile, node('p', { class: 'style-help secondary-style-note' }, 'Isi terjemahan sendiri atau impor SRT/VTT/TXT. SRT/VTT dipasangkan berdasarkan waktu; TXT satu baris per subtitle. Semua efek dan animasi di atas hanya berlaku pada bahasa kedua.'));
     review.after(bilingual);
     function secondaryDefaults(cue) {
       return styles.resolveSecondaryStyle(styles.resolveStyle(state().style, cue), cue);
@@ -3198,11 +3233,18 @@ self.addEventListener('message', async ({ data }) => {
       if (!cue.secondaryStyle) cue.secondaryStyle = { fontFamily: lang.value === 'arabic' ? 'amiri' : 'sans', fontSize: 32, color: '#f4ce9a', displayMode: 'line', animation: 'none', uppercase: false };
       markDirty('secondary:' + cue.id); render();
     });
-    const secondaryFields = [[secondFont, 'fontFamily'], [secondColor.input, 'color'], [secondSize.input, 'fontSize'], [secondDirection, 'direction']];
+    const secondaryFields = [[secondFont, 'fontFamily'], [secondColor.input, 'color'], [secondAccent.input, 'accentColor'], [secondSize.input, 'fontSize'], [secondOutline.input, 'outlineWidth'], [secondDirection, 'direction'], [secondAnimation, 'animation']];
     secondaryFields.forEach(([input, key]) => input.addEventListener('input', () => {
       const cue = api.selectedCue(); if (busy || !cue) return;
-      cue.secondaryStyle = { ...cue.secondaryStyle, ...styles.sanitizeStyle({ [key]: key === 'fontSize' ? Number(input.value) : input.value }, { partial: true }) };
+      const numeric = key === 'fontSize' || key === 'outlineWidth';
+      cue.secondaryStyle = { ...cue.secondaryStyle, ...styles.sanitizeStyle({ [key]: numeric ? Number(input.value) : input.value }, { partial: true }) };
       markDirty('second-style:' + cue.id + ':' + key); render();
+    }));
+    secondPresetButtons.forEach(item => item.addEventListener('click', () => {
+      const cue = api.selectedCue(); if (busy || !cue) return;
+      cue.secondaryStyle = { ...cue.secondaryStyle, ...styles.sanitizeStyle({ preset: item.dataset.preset }, { partial: true }) };
+      secondPresetButtons.forEach(button => { const active = button === item; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
+      markDirty('second-style:' + cue.id + ':preset'); render();
     }));
     lang.addEventListener('change', () => { const cue = api.selectedCue(); if (busy || !cue) return; cue.secondaryLanguage = lang.value; cue.secondaryStyle = { ...cue.secondaryStyle, direction: lang.value === 'arabic' ? 'rtl' : 'auto', ...(lang.value === 'arabic' ? { fontFamily: 'amiri', uppercase: false } : {}) }; commit(); });
     copySecond.addEventListener('click', () => { const cue = api.selectedCue(); if (busy || !cue) return; state().cues.filter(item => item.secondaryText).forEach(item => { item.secondaryStyle = { ...cue.secondaryStyle }; }); commit(); toast('Gaya bahasa kedua diterapkan.'); });
@@ -3279,8 +3321,14 @@ self.addEventListener('message', async ({ data }) => {
       count.textContent = chosen.length + ' dipilih'; selectAll.input.checked = Boolean(state().cues.length && chosen.length === state().cues.length); selectAll.input.indeterminate = chosen.length > 0 && chosen.length < state().cues.length;
       group.disabled = busy || !chosen.length; group.classList.toggle('active', state().styleScope === 'batch'); clear.disabled = busy || !chosen.length; split.disabled = busy || !cue || String(cue.text).trim().split(/\s+/u).length < 2; merge.disabled = busy || chosen.length < 2;
       bilingualTitle.textContent = cue ? 'Bahasa kedua · subtitle ' + (state().cues.indexOf(cue) + 1) : 'Klik satu subtitle untuk mengedit bahasa kedua.';
-      if (cue) { const style = secondaryDefaults(cue); setValue('secondaryText', cue.secondaryText || ''); setValue('secondaryLanguage', cue.secondaryLanguage || 'indonesian'); setValue('secondaryFont', style.fontFamily); setValue('secondaryColor', style.color); setValue('secondarySize', style.fontSize); setValue('secondaryDirection', style.direction); } else setValue('secondaryText', '');
-      [secondary, lang, secondFont, secondColor.input, secondSize.input, secondDirection, copySecond].forEach(el => { el.disabled = busy || !cue; });
+      if (cue) {
+        const style = secondaryDefaults(cue);
+        setValue('secondaryText', cue.secondaryText || ''); setValue('secondaryLanguage', cue.secondaryLanguage || 'indonesian'); setValue('secondaryFont', style.fontFamily); setValue('secondaryColor', style.color); setValue('secondaryAccent', style.accentColor); setValue('secondarySize', style.fontSize); setValue('secondaryOutline', style.outlineWidth); setValue('secondaryDirection', style.direction); setValue('secondaryAnimation', style.animation);
+        secondPresetButtons.forEach(button => { const active = button.dataset.preset === style.preset; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
+      } else {
+        setValue('secondaryText', ''); secondPresetButtons.forEach(button => { button.classList.remove('active'); button.setAttribute('aria-pressed', 'false'); });
+      }
+      [secondary, lang, secondFont, secondColor.input, secondAccent.input, secondSize.input, secondOutline.input, secondDirection, secondAnimation, copySecond, ...secondPresetButtons].forEach(el => { el.disabled = busy || !cue; });
       importSecond.disabled = busy || !state().cues.length; ass.disabled = txt.disabled = busy || !state().cues.length; exportFormat.disabled = busy;
       if (checking) validate(); showMatches(); languageHint();
     }
@@ -3477,7 +3525,7 @@ self.addEventListener('message', async ({ data }) => {
       build: 'Kata muncul satu per satu hingga kalimat tersusun penuh.',
       stack: 'Grup tiga kata ditumpuk; kata yang sedang diucapkan tampil lebih besar.'
     };
-    let frameRequest = 0, demoLastTime = 0, toastTimeout = 0, progressTask = 0, loadSerial = 0, transcriber = null, subtitleFontsReady = null;
+    let frameRequest = 0, demoLastTime = 0, toastTimeout = 0, audioCheckTimer = 0, progressTask = 0, loadSerial = 0, transcriber = null, subtitleFontsReady = null;
     let editSession = null, editingTools = null, pendingRecovery = null, timelineWorkspace = null, editorFeatures = null;
     const timingDrafts = new Map();
     let sessionInfo = { canUndo: false, canRedo: false, status: 'ready', savedAt: null };
@@ -3679,6 +3727,30 @@ self.addEventListener('message', async ({ data }) => {
       if (state.playing && !frameRequest) frameRequest = requestAnimationFrame(animate);
     }
 
+    function updateSoundControl() {
+      const button = $('soundButton');
+      const muted = video.muted || video.volume === 0;
+      button.classList.toggle('is-muted', muted);
+      button.setAttribute('aria-pressed', String(muted));
+      button.setAttribute('aria-label', muted ? 'Aktifkan suara video' : 'Matikan suara video');
+      button.title = muted ? 'Suara mati · klik untuk mengaktifkan' : 'Suara aktif · klik untuk mematikan';
+    }
+
+    function scheduleAudioDecodeCheck() {
+      clearTimeout(audioCheckTimer);
+      if (video.muted || video.volume === 0) return;
+      if (video.audioTracks && video.audioTracks.length === 0) {
+        toast('Video terbaca, tetapi browser tidak menemukan trek audio. Gunakan MP4 H.264 + AAC atau WebM + Opus.', true); return;
+      }
+      if (!('webkitAudioDecodedByteCount' in video)) return;
+      const decoded = Number(video.webkitAudioDecodedByteCount) || 0, startedAt = video.currentTime;
+      audioCheckTimer = setTimeout(() => {
+        if (state.file && !video.paused && !video.muted && video.volume > 0 && video.currentTime > startedAt + 0.5 && (Number(video.webkitAudioDecodedByteCount) || 0) <= decoded) {
+          toast('Gambar dapat diputar, tetapi audio tidak dapat dibaca browser. Coba MP4 H.264 + AAC atau WebM + Opus.', true);
+        }
+      }, 2500);
+    }
+
     function pause() {
       state.playing = false; demoLastTime = 0;
       if (!video.paused) video.pause();
@@ -3691,8 +3763,11 @@ self.addEventListener('message', async ({ data }) => {
       if (state.currentTime < state.trimStart || state.currentTime >= state.trimEnd - 0.03) seek(state.trimStart);
       if (!state.demo) {
         try {
-          if (window.SubstudioExporter && window.SubstudioExporter.resumeAudio) await window.SubstudioExporter.resumeAudio(video);
+          // Keep native media audio for preview. Web Audio is created lazily by
+          // exportVideo; after an export, only resume that already-owned graph.
+          if (window.SubstudioExporter?.resumePlaybackAudio) await window.SubstudioExporter.resumePlaybackAudio(video);
           await video.play();
+          scheduleAudioDecodeCheck();
         } catch (error) { toast('Video belum bisa diputar: ' + error.message, true); return; }
       }
       state.playing = true; demoLastTime = 0; updatePlayback();
@@ -3713,6 +3788,7 @@ self.addEventListener('message', async ({ data }) => {
       $('exportButton').disabled = busy || (!state.file && !state.cues.length);
       $('saveProjectButton').disabled = busy || (!duration && !state.cues.length);
       ['playButton', 'backButton', 'forwardButton'].forEach(id => { $(id).disabled = !media || state.busy === 'export'; });
+      $('soundButton').disabled = busy || !state.file || !media;
       $('seekSlider').disabled = !duration || state.busy === 'export'; $('seekSlider').max = String(state.duration || 1);
       const cue = selectedCue(), wordScope = state.styleScope === 'word', styleDisabled = busy || (state.styleScope !== 'all' && !cue) || wordScope && !selectedWord();
       styleControls.forEach(([id, field]) => { $(id).disabled = styleDisabled || wordScope && !wordStyleFields.has(field); });
@@ -3722,7 +3798,7 @@ self.addEventListener('message', async ({ data }) => {
       $('wordStyleWords').querySelectorAll('button').forEach(button => { button.disabled = busy; });
       $('resetCueStyleButton').disabled = busy || !cue || (wordScope ? !hasSelectedWordStyle() : !cue.style || !Object.keys(cue.style).length);
       ['trimStart', 'trimEnd'].forEach(id => { $(id).disabled = busy || !duration; $(id).max = String(state.duration || 0); });
-      document.querySelectorAll('[data-preset]').forEach(button => { button.disabled = styleDisabled; });
+      document.querySelectorAll('.style-card [data-preset]').forEach(button => { button.disabled = styleDisabled; });
       $('cueList').querySelectorAll('button, input, textarea').forEach(input => { input.disabled = busy; });
       $('cueList').querySelectorAll('.cue-move-up, .cue-move-down').forEach(button => { button.disabled = busy || button.dataset.boundary === 'true'; });
       $('cueOrderHint').hidden = !state.manualOrder;
@@ -3808,7 +3884,7 @@ self.addEventListener('message', async ({ data }) => {
       $('resetCueStyleButton').textContent = isWordScope ? '↺ Ikuti gaya subtitle lagi' : '↺ Ikuti gaya dasar lagi';
       refreshWordStylePicker();
       if (editorFeatures) editorFeatures.refresh();
-      document.querySelectorAll('[data-preset]').forEach(button => { const active = button.dataset.preset === style.preset; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
+      document.querySelectorAll('.style-card [data-preset]').forEach(button => { const active = button.dataset.preset === style.preset; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
     }
 
     function selectCue(cue, options = {}) {
@@ -3936,7 +4012,7 @@ self.addEventListener('message', async ({ data }) => {
     }
 
     function revokeMedia() {
-      pause(); video.removeAttribute('src'); video.load();
+      clearTimeout(audioCheckTimer); pause(); video.removeAttribute('src'); video.load();
       if (state.fileUrl) URL.revokeObjectURL(state.fileUrl);
       state.file = null; state.fileUrl = null; state.audioFile = null;
       if (timelineWorkspace) timelineWorkspace.setMedia(null);
@@ -3975,6 +4051,7 @@ self.addEventListener('message', async ({ data }) => {
       const previous = { ...state }, previousMeta = $('videoMeta').textContent, previousAiStatus = $('aiStatus').textContent;
       const ticket = ++loadSerial;
       revokeMedia(); state.demo = false; state.loading = true;
+      video.defaultMuted = false; video.muted = false; video.volume = 1; video.removeAttribute('muted'); updateSoundControl();
       state.file = file; state.fileUrl = URL.createObjectURL(file); video.src = state.fileUrl;
       $('videoMeta').textContent = 'Memuat ' + file.name + '…'; updateControls();
       try {
@@ -4246,6 +4323,17 @@ self.addEventListener('message', async ({ data }) => {
     $('demoButton').addEventListener('click', loadDemo); $('generateButton').addEventListener('click', generate); $('addCueButton').addEventListener('click', addCue);
     $('effectsDemoButton').addEventListener('click', loadEffectsDemo);
     $('saveProjectButton').addEventListener('click', saveProject); $('playButton').addEventListener('click', () => state.playing ? pause() : play());
+    $('soundButton').addEventListener('click', async () => {
+      if (!state.file || state.busy === 'export') return;
+      const enable = video.muted || video.volume === 0;
+      video.defaultMuted = false; video.muted = !enable;
+      if (enable && video.volume === 0) video.volume = 1;
+      if (enable && window.SubstudioExporter?.resumePlaybackAudio) {
+        try { await window.SubstudioExporter.resumePlaybackAudio(video); }
+        catch (error) { toast('Suara belum bisa diaktifkan: ' + error.message, true); }
+      }
+      updateSoundControl();
+    });
     $('backButton').addEventListener('click', () => seek(state.currentTime - 5)); $('forwardButton').addEventListener('click', () => seek(state.currentTime + 5));
     $('seekSlider').addEventListener('input', event => seek(Number(event.target.value)));
     $('timelineTrack').addEventListener('click', event => { if (state.busy === 'export') return; const rect = $('timelineTrack').getBoundingClientRect(); seek((event.clientX - rect.left) / rect.width * state.duration); });
@@ -4255,7 +4343,7 @@ self.addEventListener('message', async ({ data }) => {
       const input = $(id);
       changeStyle(field, input.type === 'checkbox' ? input.checked : input.type === 'range' ? Number(input.value) : input.value);
     }));
-    document.querySelectorAll('[data-preset]').forEach(button => button.addEventListener('click', () => changeStyle('preset', button.dataset.preset)));
+    document.querySelectorAll('.style-card [data-preset]').forEach(button => button.addEventListener('click', () => changeStyle('preset', button.dataset.preset)));
     $('styleAllButton').addEventListener('click', () => { state.styleScope = 'all'; syncStyleInputs(); updateControls(); render(); });
     $('styleCueButton').addEventListener('click', () => { if (selectedCue()) { state.styleScope = 'cue'; syncStyleInputs(); updateControls(); render(); } });
     $('styleWordButton').addEventListener('click', () => { const cue = selectedCue(); if (cue) selectWordStyle(cue.id, selectedWord() ? state.selectedWordIndex : 0); });
@@ -4283,6 +4371,7 @@ self.addEventListener('message', async ({ data }) => {
     video.addEventListener('play', () => { if (state.busy !== 'export') { state.playing = true; updatePlayback(); } });
     video.addEventListener('pause', () => { if (state.busy !== 'export') { state.playing = false; updatePlayback(); } });
     video.addEventListener('ended', pause);
+    video.addEventListener('volumechange', updateSoundControl);
     document.addEventListener('keydown', event => {
       if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.isComposing && !$('exportDialog').open && !$('helpDialog').open) {
         const key = event.key.toLowerCase();
@@ -5136,7 +5225,7 @@ INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
   <input id="audioInput" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac" hidden>
   <input id="subtitleInput" type="file" accept=".srt,.vtt,.txt" hidden>
   <input id="projectInput" type="file" accept=".json" hidden>
-  <video id="sourceVideo" preload="metadata" playsinline hidden></video>
+  <video id="sourceVideo" class="media-source" preload="metadata" playsinline aria-hidden="true" tabindex="-1"></video>
 
   <header class="app-header">
     <a class="brand" href="#pageTitle" aria-label="Substudio beranda"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>substudio<span class="brand-dot">.</span></a>
@@ -5177,7 +5266,7 @@ INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
               <div class="stage-number" aria-hidden="true">01 / CREATE</div>
             </div>
           </div>
-          <div class="playback-bar"><div class="transport"><button id="backButton" class="button icon-button ghost" title="Mundur 5 detik" aria-label="Mundur 5 detik" disabled><svg class="icon"><use href="#i-back"/></svg></button><button id="playButton" class="play-button" aria-label="Putar video" disabled><svg class="icon"><use href="#i-play"/></svg></button><button id="forwardButton" class="button icon-button ghost" title="Maju 5 detik" aria-label="Maju 5 detik" disabled><svg class="icon"><use href="#i-forward"/></svg></button><span class="timecode"><strong id="currentTime">00:00.0</strong><span>/</span><span id="totalTime">00:00.0</span></span></div><span class="keyboard-hint"><kbd>SPACE</kbd> putar / jeda</span></div>
+          <div class="playback-bar"><div class="transport"><button id="backButton" class="button icon-button ghost" title="Mundur 5 detik" aria-label="Mundur 5 detik" disabled><svg class="icon"><use href="#i-back"/></svg></button><button id="playButton" class="play-button" aria-label="Putar video" disabled><svg class="icon"><use href="#i-play"/></svg></button><button id="forwardButton" class="button icon-button ghost" title="Maju 5 detik" aria-label="Maju 5 detik" disabled><svg class="icon"><use href="#i-forward"/></svg></button><button id="soundButton" class="button icon-button ghost sound-toggle" type="button" title="Suara aktif · klik untuk mematikan" aria-label="Matikan suara video" aria-pressed="false" disabled><svg class="icon"><use href="#i-audio"/></svg></button><span class="timecode"><strong id="currentTime">00:00.0</strong><span>/</span><span id="totalTime">00:00.0</span></span></div><span class="keyboard-hint"><kbd>SPACE</kbd> putar / jeda</span></div>
           <div class="timeline"><div id="timelineLabels" class="timeline-labels"><span>00:00</span><span>00:05</span><span>00:10</span><span>00:15</span><span>00:20</span></div><div class="timeline-lanes"><div class="lane-icon"><svg class="icon"><use href="#i-captions"/></svg></div><div id="timelineTrack" class="timeline-track" aria-describedby="timelineEditHint"><span class="timeline-placeholder">Subtitle-mu muncul di sini</span></div></div><p id="timelineEditHint" class="timeline-edit-hint">Geser balok untuk memindahkan waktu. Tarik ujungnya untuk mengubah durasi.</p><input id="seekSlider" class="seek-slider" type="range" min="0" max="100" step="0.01" value="0" aria-label="Geser waktu video" disabled></div>
         </section>
 
